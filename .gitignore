@@ -1,0 +1,11 @@
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Carpetas temporales
+*.log
+*.tmp
+.env
+__pycache__/
+output/
+datos/
