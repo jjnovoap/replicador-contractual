@@ -338,9 +338,9 @@ def word_a_pdf(ruta_word, ruta_pdf):
 # 5. FUNCIONES DE COMUNICACIÓN (EMAIL)
 # =============================================================================
 
-def enviar_email_lote(lote_archivos_y_datos: list, remitente_email: str, remitente_password: str, correo_supervisor: str, ID_BATCH_UNICO: str):
+def enviar_email_lote(lote_archivos_y_datos: list, remitente_email: str, remitente_password: str, destinatarios_lista: list, ID_BATCH_UNICO: str):
     """
-    Envía un ÚNICO email al supervisor con todas las solicitudes de un lote
+    Envía un ÚNICO email a los destinatarios con todas las solicitudes de un lote
     como adjuntos. Incluye robustos puntos de control y manejo de errores SMTP.
 
     Parámetro Clave:
@@ -358,6 +358,8 @@ def enviar_email_lote(lote_archivos_y_datos: list, remitente_email: str, remiten
     # 1. Preparación del Cuerpo del Email y Lista de Adjuntos
     lista_solicitudes = ""
     archivos_adjuntos = []
+
+    destinatarios_header = ', '.join(destinatarios_lista)
     
     for i, (_, ruta_excel, ruta_word, datos_fila) in enumerate(lote_archivos_y_datos, start=1):
         radi = datos_fila.get('radi', 'N/A')
@@ -416,7 +418,7 @@ Universidad Nacional de Colombia
         # Crear el objeto MIME
         msg = MIMEMultipart()
         msg['From'] = remitente_email
-        msg['To'] = correo_supervisor
+        msg['To'] = destinatarios_header
         msg['Subject'] = asunto_final
         msg.attach(MIMEText(cuerpo, 'plain'))
 
@@ -435,9 +437,9 @@ Universidad Nacional de Colombia
             msg.attach(part)
         
         # 4. Envío Final
-        server.sendmail(remitente_email, correo_supervisor, msg.as_string())
+        server.sendmail(remitente_email, destinatarios_lista, msg.as_string())
 
-        print(f"✅ Lote enviado con éxito al supervisor. Asunto: '{asunto_final}'")
+        print(f"✅ Lote enviado con éxito a destinatarios '{destinatarios_header}'. Asunto: '{asunto_final}'")
         print(f"✅ Total de adjuntos: {len(archivos_adjuntos)}")
             
     except smtplib.SMTPAuthenticationError as e:

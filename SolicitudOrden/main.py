@@ -18,8 +18,6 @@ from dotenv import load_dotenv
 # -----------------------------------------------------------------------------
 from config import CAMPOS
 # Importación de todas las funciones de utilidad.
-# Estas funciones manejan la lógica de carga, procesamiento (Excel/Word),
-# conversión (PDF) y comunicación (Email).
 from utils import cargar_plantilla, cargar_datos, procesar_solicitud, guardar_solicitud, generar_word_obligaciones, ajustar_tamano_celdas, excel_a_pdf, word_a_pdf, enviar_email_lote
 
 # -----------------------------------------------------------------------------
@@ -36,41 +34,70 @@ def main():
     load_dotenv() 
     
     # 2. Extracción y Conversión de Variables de Configuración
-    # TAMANO_LOTE_EMAIL: Define el número máximo de solicitudes a adjuntar en un único correo al supervisor.
     TAMANO_LOTE_EMAIL = int(os.environ.get("EMAIL_BATCH_SIZE", 10))
-    
-    # Credenciales de Email: Nombres deben coincidir exactamente con el archivo .env.
-    # ⚠️ CRÍTICO: Asegurarse de usar una Contraseña de Aplicación si se activa 2FA.
     REMITENTE_EMAIL = os.environ.get("EMAIL_REMITENTE")
     REMITENTE_PASSWORD = os.environ.get("REMITENTE_PASSWORD")
-    CORREO_SUPERVISOR = os.environ.get("CORREO_SUPERVISOR")
-
-    # 3. Verificación Crítica de Credenciales
-    if not REMITENTE_EMAIL or not REMITENTE_PASSWORD or not CORREO_SUPERVISOR:
-        print("❌ ERROR CRÍTICO: Las variables de entorno para las credenciales de email (EMAIL_REMITENTE, REMITENTE_PASSWORD, CORREO_SUPERVISOR) no están definidas.")
-        return # Termina el programa de forma segura si faltan credenciales.
-
-    # 4. Definición de Rutas del Sistema
+    CORREO_COPIA = os.environ.get("CORREO_COPIA") # Correo de copia opcional
+    
+    # 3. Definición de Rutas del Sistema
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
-    # ⚠️ MANTENIMIENTO: Estos paths deben reflejar la estructura de directorios.
     RUTA_DATOS = os.path.join(BASE_DIR, 'datos', '2. BaseDatos -enviar.xlsx')
     RUTA_PLANTILLA = os.path.join(BASE_DIR, 'datos', 'plantillas', 'SolicitudOrden.xlsx')
     RUTA_OUTPUT = os.path.join(BASE_DIR, 'output')
     RUTA_PLANTILLA_WORD = os.path.join(BASE_DIR, "datos", "plantillas", "Anexo.docx")
-
-    # -------------------------------------------------------------------------
-    ## 📚 Preparación de Datos y Estructura
-    # -------------------------------------------------------------------------
     
     os.makedirs(RUTA_OUTPUT, exist_ok=True) # Crea el directorio 'output' si no existe.
+
+    # -------------------------------------------------------------------------
+    ## 📚 Carga de Datos y Extracción del Correo Principal (Supervisor)
+    # -------------------------------------------------------------------------
     
-    # Cargar la base de datos y extraer los encabezados
+    # 4. Cargar la base de datos y extraer los encabezados
     wb_datos = cargar_datos(RUTA_DATOS)
     hoja_datos = wb_datos.active
     headers = [cell.value for cell in hoja_datos[1]] # Encabezados (primera fila)
 
-    # Lista de acumulación para la Fase 2 (Envío). Almacena tuplas de (nombre, ruta_excel, ruta_word, datos_fila)
+    # 🚨 PASO CLAVE: EXTRAER EL CORREO PRINCIPAL ANTES DEL BUCLE 🚨
+    CORREO_SUPERVISOR_PRINCIPAL = None
+    try:
+        # Obtener el primer registro de datos (Fila 2) para el correo del supervisor
+        fila_principal = next(hoja_datos.iter_rows(min_row=2, max_row=2, values_only=True))
+        datos_fila_principal = dict(zip(headers, fila_principal))
+        
+        # 5. Definir el CORREO_SUPERVISOR usando el dato extraído
+        CORREO_SUPERVISOR_PRINCIPAL = datos_fila_principal.get('correo_director_proyecto')
+        
+    except StopIteration:
+        print("❌ ERROR CRÍTICO: El archivo de datos no contiene registros de contratos.")
+        return
+    except Exception as e:
+        print(f"❌ ERROR al intentar leer el correo del director del proyecto: {e}")
+        return
+        
+    # -------------------------------------------------------------------------
+    ## ⚙️ Definición de Destinatarios y Validación Final
+    # -------------------------------------------------------------------------
+    
+    # 6. CREAR LA LISTA FINAL DE DESTINATARIOS
+    CORREOS_DESTINATARIOS_RAW = [
+        CORREO_SUPERVISOR_PRINCIPAL, # Principal, extraído del Excel
+        CORREO_COPIA                 # Copia, extraído de .env
+    ]
+
+    # Filtra la lista (eliminando None o cadenas vacías)
+    DESTINATARIOS_LISTA = [c.strip() for c in CORREOS_DESTINATARIOS_RAW if c and c.strip()]
+    
+    # 7. Validación Crítica Final
+    if not REMITENTE_EMAIL or not REMITENTE_PASSWORD:
+        print("❌ ERROR CRÍTICO: Las variables de entorno para las credenciales de email (EMAIL_REMITENTE, REMITENTE_PASSWORD) no están definidas.")
+        return # Termina el programa de forma segura si faltan credenciales.
+
+    if not DESTINATARIOS_LISTA:
+        print("❌ ERROR CRÍTICO: No se pudo determinar un destinatario válido (correo_director_proyecto o CORREO_COPIA).")
+        return
+
+    # Lista de acumulación para la Fase 2 (Envío).
     ordenes_generadas = [] 
     
     # -------------------------------------------------------------------------
@@ -80,7 +107,7 @@ def main():
     
     # Itera sobre cada registro (fila) de la base de datos
     for row in hoja_datos.iter_rows(min_row=2, values_only=True):
-        datos_fila = dict(zip(headers, row)) # Mapear los datos de la fila a un diccionario
+        datos_fila = dict(zip(headers, row)) # Mapear los datos de la fila a un diccionario (¡Ahora dentro del bucle!)
         
         # 1. Procesamiento de la Plantilla de Solicitud (Excel)
         wb_plantilla = cargar_plantilla(RUTA_PLANTILLA)
@@ -88,13 +115,11 @@ def main():
         hoja_procesada = wb_procesado.active
         
         # 2. Ajuste Dinámico de Celdas (Wrap Text)
-        # ⚠️ MANTENIMIENTO: Estas coordenadas (fila, columna) dependen de la estructura de la plantilla.
         celdas_a_ajustar = [
             (21, 2), (24, 2), (27, 2), # Columna B
             (45, 3), (46, 3), (47, 3), (48, 3), (49, 3) # Columna C
         ]
         
-        # Llama a la función de ajuste. Usa 197 unidades Excel (≈1383px) por defecto.
         ajustar_tamano_celdas(
             hoja_procesada,
             celdas_a_ajustar
@@ -108,7 +133,7 @@ def main():
         excel_a_pdf(
             ruta_excel,
             ruta_excel.replace(".xlsx", ".pdf"),
-            paginas_to_keep=[0]  # Asegura que solo se incluye la primera hoja.
+            paginas_to_keep=[0] 
         )
 
         # 5. Generar y Exportar Anexo de Obligaciones (Word y PDF)
@@ -137,9 +162,7 @@ def main():
     for i in range(0, len(ordenes_generadas), TAMANO_LOTE_EMAIL):
         lote = ordenes_generadas[i:i + TAMANO_LOTE_EMAIL]
         
-        # 🚨 Generar un ID ÚNICO (UUID corto) para este lote de correos 🚨
-        # Esto se usa para alterar ligeramente el asunto del email y evitar que el servidor 
-        # agrupe correos de ejecuciones distintas.
+        # Generar un ID ÚNICO (UUID corto) para este lote de correos
         id_batch_unico = uuid.uuid4().hex[:6]
 
         # Llamada a la función de envío de correo electrónico.
@@ -147,8 +170,8 @@ def main():
             lote, 
             REMITENTE_EMAIL, 
             REMITENTE_PASSWORD, 
-            CORREO_SUPERVISOR, 
-            id_batch_unico # Se usa el ID para la unicidad del asunto
+            DESTINATARIOS_LISTA, 
+            id_batch_unico 
         )
         
     print("\n--- Proceso completo de generación y envío ---")
