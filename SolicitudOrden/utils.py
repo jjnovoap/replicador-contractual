@@ -10,6 +10,7 @@ import math
 import os
 import subprocess # Usado para ejecutar comandos externos (ej. LibreOffice)
 import smtplib # Conexión al servidor de correo (SMTP)
+import mimetypes
 from email.mime.multipart import MIMEMultipart # Contenedor principal del email
 from email.mime.text import MIMEText # Cuerpo de texto (plain)
 from email.mime.base import MIMEBase # Contenedor base para adjuntos
@@ -20,6 +21,7 @@ from email import encoders # Utilidad para codificar adjuntos (Base64)
 # -----------------------------------------------------------------------------
 import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment
 
 from docx import Document
@@ -45,15 +47,24 @@ tool = language_tool_python.LanguageTool('es')
 # 1. FUNCIONES DE CORECCIÓN Y CARGA
 # =============================================================================
 
+
 def corregir_texto(texto: str) -> str:
     """
-    Función de utilidad que aplica la corrección ortográfica y gramatical
-    a un texto dado en español usando language_tool_python.
+    Corrige texto con language_tool_python. Seguro para None/strings vacíos.
     """
-    if not texto:
+    try:
+        if texto is None:
+            return ""
+        texto = str(texto).strip()
+        if not texto:
+            return ""
+        matches = tool.check(texto)
+        return language_tool_python.utils.correct(texto, matches)
+    except Exception as e:
+        # Si el corrector falla, devolvemos el texto original (no None)
+        print(f"⚠️ language_tool fallo: {e}")
         return texto
-    matches = tool.check(texto)
-    return language_tool_python.utils.correct(texto, matches)
+
 
 def cargar_plantilla(ruta_plantilla):
     """
@@ -71,13 +82,17 @@ def cargar_datos(ruta_datos):
 
 def buscar_y_reemplazar(hoja, texto_buscar, texto_reemplazar):
     """
-    Busca una cadena de texto específica (marcador) y la reemplaza por un nuevo
-    valor en todas las celdas de una hoja de Excel.
+    Reemplaza marcadores en las celdas de una hoja. Trivializa None para evitar 'None' textual.
     """
+    if texto_reemplazar is None:
+        texto_reemplazar = ""
+    texto_reemplazar = str(texto_reemplazar)
+
     for row in hoja.iter_rows():
         for cell in row:
-            # Solo procesa valores de celda que sean cadenas de texto
-            if cell.value and isinstance(cell.value, str) and texto_buscar in cell.value:
+            if cell.value is None:
+                continue
+            if isinstance(cell.value, str) and texto_buscar in cell.value:
                 cell.value = cell.value.replace(texto_buscar, texto_reemplazar)
 
 # =============================================================================
@@ -172,10 +187,23 @@ def procesar_solicitud(wb_plantilla, datos_fila):
     return wb_plantilla
 
 def guardar_solicitud(wb, nombre_archivo, ruta_output):
-    """Guarda el objeto Workbook de Excel procesado en la ruta de salida."""
+    """Guarda el objeto Workbook de Excel procesado en la ruta de salida.
+       Antes de guardar limpia celdas None o 'None' para que la planilla no muestre 'None'."""
+    # Limpieza preventiva: reemplazar None o 'None' por cadena vacía
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                # ⚠️ Evitar tocar celdas combinadas (read-only)
+                if isinstance(cell, MergedCell):
+                    continue
+                if cell.value is None:
+                    cell.value = ""
+                elif isinstance(cell.value, str) and cell.value.strip().lower() == "none":
+                    cell.value = ""
     ruta_completa = os.path.join(ruta_output, nombre_archivo)
     wb.save(ruta_completa)
     return ruta_completa
+
 
 # =============================================================================
 # 3. FUNCIONES DE PROCESAMIENTO DE WORD
@@ -209,16 +237,15 @@ def generar_word_obligaciones(datos_fila, ruta_output, nombre_archivo, ruta_plan
         print(f"❌ Error al cargar la plantilla de Word: {e}")
         return None
 
-    # 2. Remplazo de marcadores generales en párrafos
+     # 2. Remplazo de marcadores generales en párrafos
     for p in doc.paragraphs:
         for campo, valor in datos_fila.items():
-            # Evita procesar los campos de obligación y los valores nulos
-            if campo in OBLIGACIONES or valor is None:
+            if campo in OBLIGACIONES:
                 continue
             marcador_word = f"{{{campo}}}"
             if marcador_word in p.text:
-                p.text = p.text.replace(marcador_word, corregir_texto(str(valor)))
-                # ⚠️ Aplicación de formato (ajustar si la fuente/tamaño cambia)
+                # corregir_texto maneja None -> ""
+                p.text = p.text.replace(marcador_word, corregir_texto(valor))
                 p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                 for run in p.runs:
                     run.font.name = "Calibri"
@@ -339,48 +366,36 @@ def word_a_pdf(ruta_word, ruta_pdf):
 # =============================================================================
 
 def enviar_email_lote(lote_archivos_y_datos: list, remitente_email: str, remitente_password: str, destinatarios_lista: list, ID_BATCH_UNICO: str):
-    """
-    Envía un ÚNICO email a los destinatarios con todas las solicitudes de un lote
-    como adjuntos. Incluye robustos puntos de control y manejo de errores SMTP.
-
-    Parámetro Clave:
-    - ID_BATCH_UNICO: Cadena (True o False) proveniente de la función de alternancia
-      usada en el ASUNTO para evitar el agrupamiento de emails.
-    """
     ASUNTO_BASE = "Solicitud(es) para aval"
-    
-    # 🚨 Construcción del Asunto Único: Clave para evitar el agrupamiento en Gmail/Outlook.
     asunto_final = f"{ASUNTO_BASE} Ref: {ID_BATCH_UNICO}"
-    
     num_ordenes = len(lote_archivos_y_datos)
     print(f"\n--- INICIO ENVÍO SMTP (Lote de {num_ordenes} órdenes) ---")
-    
-    # 1. Preparación del Cuerpo del Email y Lista de Adjuntos
+
     lista_solicitudes = ""
     archivos_adjuntos = []
-
     destinatarios_header = ', '.join(destinatarios_lista)
-    
+
     for i, (_, ruta_excel, ruta_word, datos_fila) in enumerate(lote_archivos_y_datos, start=1):
         radi = datos_fila.get('radi', 'N/A')
         nombre_contratista = datos_fila.get('nombre_contratista', 'Contratista')
-        
-        # Generar la línea de la lista de solicitudes para el cuerpo del email
         lista_solicitudes += f"{i}. CE - {radi} - 2025 - {nombre_contratista}\n"
 
-        # Añadir rutas de los PDFs generados a la lista de adjuntos
         ruta_pdf_excel = ruta_excel.replace(".xlsx", ".pdf")
         if os.path.exists(ruta_pdf_excel):
-             archivos_adjuntos.append(ruta_pdf_excel)
+            archivos_adjuntos.append(os.path.abspath(ruta_pdf_excel))
 
-        ruta_pdf_word = ruta_word.replace(".docx", ".pdf") if ruta_word and os.path.exists(ruta_word.replace(".docx", ".pdf")) else None
-        if ruta_pdf_word:
-            archivos_adjuntos.append(ruta_pdf_word)
+        ruta_pdf_word = None
+        if ruta_word:
+            posible_pdf = ruta_word.replace(".docx", ".pdf")
+            if os.path.exists(posible_pdf):
+                archivos_adjuntos.append(os.path.abspath(posible_pdf))
 
-    # 1.2 Ensamblar el cuerpo final del email
+    # deduplicar manteniendo orden
+    archivos_adjuntos = list(dict.fromkeys(archivos_adjuntos))
+
     cuerpo = f"""Buen día profesor.
 
-De manera atenta remito la(s) siguiente(s) solicitud(es) para su Vo.Bo., adjunta(s) a este correo:
+De manera atenta remito la(s) siguiente(s) solicitud(es) para su Vo.Bo.
 
 {lista_solicitudes}
 Gracias de antemano. 
@@ -394,63 +409,83 @@ Departamento de Lenguas Extranjeras
 Facultad de Ciencias Humanas - Sede Bogotá
 Universidad Nacional de Colombia
 """
-    
-    # 2. Conexión y Envío (Bloque Crítico)
+
     if not archivos_adjuntos:
         print("❌ Error: No se encontraron archivos PDF válidos para adjuntar. Cancelando envío.")
         return
-    
-    print(f"DEBUG: Archivos adjuntos listos. Total: {len(archivos_adjuntos)}")
+
+    # DEBUG: muestra existencia y tamaños
+    print("DEBUG: Archivos candidatos (ruta - existe - tamaño bytes):")
+    for p in archivos_adjuntos:
+        try:
+            size = os.path.getsize(p) if os.path.exists(p) else -1
+        except Exception:
+            size = -1
+        print(f" - {p} | exists={os.path.exists(p)} | size={size}")
 
     server = None
     try:
-        # Conexión al servidor SMTP de Gmail (ajustar si se usa otro proveedor)
         print("DEBUG: Intentando conexión a SMTP (smtp.gmail.com:587)...")
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         print("DEBUG: Conexión TLS establecida.")
-        
-        # Autenticación: Requiere una 'Contraseña de Aplicación' si se usa 2FA.
-        print("DEBUG: Intentando autenticación (login)...")
         server.login(remitente_email, remitente_password)
         print("✅ AUTENTICACIÓN EXITOSA.")
-        
-        # Crear el objeto MIME
+
         msg = MIMEMultipart()
         msg['From'] = remitente_email
         msg['To'] = destinatarios_header
         msg['Subject'] = asunto_final
         msg.attach(MIMEText(cuerpo, 'plain'))
 
-        # 3. Adjuntar Archivos al Mensaje
-        for ruta_archivo in archivos_adjuntos:
-            with open(ruta_archivo, "rb") as attachment:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(attachment.read())
-            
+        def adjuntar_archivo(msg, ruta_archivo):
+            """Adjunta un archivo solo si existe, tiene tamaño y se puede leer."""
+            if not ruta_archivo or not os.path.isfile(ruta_archivo):
+                print(f"⚠️ No se adjunta (archivo no válido): {ruta_archivo}")
+                return False
+            tamaño = os.path.getsize(ruta_archivo)
+            if tamaño == 0:
+                print(f"⚠️ No se adjunta (archivo 0 bytes): {ruta_archivo}")
+                return False
+
+            ctype, encoding = mimetypes.guess_type(ruta_archivo)
+            if ctype:
+                maintype, subtype = ctype.split('/', 1)
+            else:
+                maintype, subtype = 'application', 'octet-stream'
+
+            with open(ruta_archivo, "rb") as f:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(f.read())
+
             encoders.encode_base64(part)
-            # Asegura el nombre de archivo en la cabecera
-            part.add_header(
-                'Content-Disposition',
-                f"attachment; filename= {os.path.basename(ruta_archivo)}",
-            )
+            part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(ruta_archivo)}"')
             msg.attach(part)
-        
-        # 4. Envío Final
+            print(f"✅ Archivo adjuntado: {ruta_archivo}")
+            return True
+
+        # Adjuntar
+        attached_count = 0
+        for ruta in archivos_adjuntos:
+            if adjuntar_archivo(msg, ruta):
+                attached_count += 1
+
+        if attached_count == 0:
+            print("❌ Ningún archivo pudo ser adjuntado (tamaño inválido o errores). Cancelando envío.")
+            return
+
         server.sendmail(remitente_email, destinatarios_lista, msg.as_string())
 
         print(f"✅ Lote enviado con éxito a destinatarios '{destinatarios_header}'. Asunto: '{asunto_final}'")
-        print(f"✅ Total de adjuntos: {len(archivos_adjuntos)}")
-            
+        print(f"✅ Total de adjuntos físicamente adjuntados: {attached_count}")
+
     except smtplib.SMTPAuthenticationError as e:
-        print(f"❌ ERROR CRÍTICO [SMTP AUTH]: Fallo en la autenticación. Revisa tu Contraseña de Aplicación/2FA.")
+        print(f"❌ ERROR CRÍTICO [SMTP AUTH]: {e}")
     except smtplib.SMTPServerDisconnected as e:
-        print(f"❌ ERROR CRÍTICO [SMTP DISCONNECT]: El servidor cerró la conexión inesperadamente. Revisa el puerto/firewall.")
+        print(f"❌ ERROR CRÍTICO [SMTP DISCONNECT]: {e}")
     except Exception as e:
-        print(f"❌ ERROR GENÉRICO: Fallo durante la conexión o envío. Detalle: {e}")
-        
+        print(f"❌ ERROR GENÉRICO: {e}")
     finally:
-        # Cierre de conexión, vital para liberar recursos
         if server:
             try:
                 server.quit()
